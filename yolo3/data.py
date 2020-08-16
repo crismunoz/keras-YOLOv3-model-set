@@ -7,6 +7,80 @@ from PIL import Image
 from tensorflow.keras.utils import Sequence
 from common.data_utils import normalize_image, letterbox_resize, random_resize_crop_pad, reshape_boxes, random_hsv_distort, random_horizontal_flip, random_vertical_flip, random_grayscale, random_brightness, random_chroma, random_contrast, random_sharpness, random_blur, random_motion_blur, random_mosaic_augment
 from common.utils import get_multiscale_list
+from common.tfrecord_utils import get_tfrecord_dataset
+import io
+
+def get_ground_truth_data_from_tfrecord_example(image, boxes, input_shape, augment=True, max_boxes=100):
+    image = io.BytesIO(image.numpy())
+    image = Image.open(image)
+    image_size = image.size
+    model_input_size = tuple(reversed(input_shape))
+    
+    if not augment:
+        new_image, padding_size, offset = letterbox_resize(image, target_size=model_input_size, return_padding_info=True)
+        image_data = np.array(new_image)
+        image_data = normalize_image(image_data)
+
+        # reshape boxes
+        boxes = reshape_boxes(boxes, src_shape=image_size, target_shape=model_input_size, padding_shape=padding_size, offset=offset)
+        if len(boxes)>max_boxes:
+            boxes = boxes[:max_boxes]
+
+        # fill in box data
+        box_data = np.zeros((max_boxes,5))
+        if len(boxes)>0:
+            box_data[:len(boxes)] = boxes
+
+        return image_data, box_data
+
+    # random resize image and crop|padding to target size
+    image, padding_size, padding_offset = random_resize_crop_pad(image, target_size=model_input_size)
+
+    # random horizontal flip image
+    image, horizontal_flip = random_horizontal_flip(image)
+
+    # random adjust brightness
+    image = random_brightness(image)
+
+    # random adjust color level
+    image = random_chroma(image)
+
+    # random adjust contrast
+    image = random_contrast(image)
+
+    # random adjust sharpness
+    image = random_sharpness(image)
+
+    # random convert image to grayscale
+    image = random_grayscale(image)
+
+    # random do normal blur to image
+    #image = random_blur(image)
+
+    # random do motion blur to image
+    #image = random_motion_blur(image, prob=0.2)
+
+    # random vertical flip image
+    image, vertical_flip = random_vertical_flip(image)
+
+    # random distort image in HSV color space
+    # NOTE: will cost more time for preprocess
+    #       and slow down training speed
+    #image = random_hsv_distort(image)
+
+    # reshape boxes based on augment
+    boxes = reshape_boxes(boxes, src_shape=image_size, target_shape=model_input_size, padding_shape=padding_size, offset=padding_offset, horizontal_flip=horizontal_flip, vertical_flip=vertical_flip)
+    if len(boxes)>max_boxes:
+        boxes = boxes[:max_boxes]
+
+    # prepare image & box data
+    image_data = np.array(image)
+    image_data = normalize_image(image_data)
+    box_data = np.zeros((max_boxes,5))
+    if len(boxes)>0:
+        box_data[:len(boxes)] = boxes
+
+    return image_data, box_data
 
 
 def get_ground_truth_data(annotation_line, input_shape, augment=True, max_boxes=100):
@@ -82,7 +156,6 @@ def get_ground_truth_data(annotation_line, input_shape, augment=True, max_boxes=
         box_data[:len(boxes)] = boxes
 
     return image_data, box_data
-
 
 def preprocess_true_boxes(true_boxes, input_shape, anchors, num_classes, multi_anchor_assign, iou_thresh=0.2):
     '''Preprocess true boxes to training input format
@@ -174,7 +247,6 @@ def preprocess_true_boxes(true_boxes, input_shape, anchors, num_classes, multi_a
 
     return y_true
 
-
 class Yolo3DataGenerator(Sequence):
     def __init__(self, annotation_lines, batch_size, input_shape, anchors, num_classes, enhance_augment=None, rescale_interval=-1, multi_anchor_assign=False, shuffle=True, **kwargs):
         self.annotation_lines = annotation_lines
@@ -235,8 +307,6 @@ class Yolo3DataGenerator(Sequence):
         if self.shuffle == True:
             np.random.shuffle(self.annotation_lines)
 
-
-
 def yolo3_data_generator(annotation_lines, batch_size, input_shape, anchors, num_classes, enhance_augment, rescale_interval, multi_anchor_assign):
     '''data generator for fit_generator'''
     n = len(annotation_lines)
@@ -270,8 +340,40 @@ def yolo3_data_generator(annotation_lines, batch_size, input_shape, anchors, num
         y_true = preprocess_true_boxes(box_data, input_shape, anchors, num_classes, multi_anchor_assign)
         yield [image_data, *y_true], np.zeros(batch_size)
 
+def yolo3_tfrecord_generator(annotation_file, batch_size, input_shape, anchors, num_classes, enhance_augment, rescale_interval, multi_anchor_assign):
+    '''data generator for fit_generator'''
+    #n = len(annotation_lines)
+    # prepare multiscale config
+    rescale_step = 0
+    input_shape_list = get_multiscale_list()
+    dataset = get_tfrecord_dataset(annotation_file, batch_size, train=True)
+    for data in dataset:
+        if rescale_interval > 0:
+            # Do multi-scale training on different input shape
+            rescale_step = (rescale_step + 1) % rescale_interval
+            if rescale_step == 0:
+                input_shape = input_shape_list[random.randint(0, len(input_shape_list)-1)]
+
+        image_data = []
+        box_data = []
+        for image,box in zip(*data):
+            image, box = get_ground_truth_data_from_tfrecord_example(image, box.numpy(), input_shape, augment=True)
+            image_data.append(image)
+            box_data.append(box)
+        image_data = np.array(image_data)
+        box_data = np.array(box_data)
+
+        if enhance_augment == 'mosaic':
+            # add random mosaic augment on batch ground truth data
+            image_data, box_data = random_mosaic_augment(image_data, box_data, prob=0.2)
+
+        y_true = preprocess_true_boxes(box_data, input_shape, anchors, num_classes, multi_anchor_assign)
+        yield [image_data, *y_true], np.zeros(batch_size)
+
 def yolo3_data_generator_wrapper(annotation_lines, batch_size, input_shape, anchors, num_classes, enhance_augment=None, rescale_interval=-1, multi_anchor_assign=False, **kwargs):
     n = len(annotation_lines)
     if n==0 or batch_size<=0: return None
     return yolo3_data_generator(annotation_lines, batch_size, input_shape, anchors, num_classes, enhance_augment, rescale_interval, multi_anchor_assign)
 
+def yolo3_tfrecord_generator_wrapper(annotation_file, batch_size, input_shape, anchors, num_classes, enhance_augment=None, rescale_interval=-1, multi_anchor_assign=False, **kwargs):
+    return yolo3_tfrecord_generator(annotation_file, batch_size, input_shape, anchors, num_classes, enhance_augment, rescale_interval, multi_anchor_assign)

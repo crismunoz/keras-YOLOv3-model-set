@@ -632,14 +632,11 @@ def draw_rec_prec(rec, prec, mrec, mprec, class_name, ap):
     fig.savefig(os.path.join(rec_prec_plot_path, class_name + ".png"))
     plt.cla() # clear axes for next plot
 
-
+"""
 import bokeh
 import bokeh.io as bokeh_io
 import bokeh.plotting as bokeh_plotting
 def generate_rec_prec_html(mrec, mprec, scores, class_name, ap):
-    """
-     generate dynamic P-R curve HTML page for each class
-    """
     rec_prec_plot_path = os.path.join('result' ,'classes')
     os.makedirs(rec_prec_plot_path, exist_ok=True)
     bokeh_io.output_file(os.path.join(rec_prec_plot_path, class_name + '.html'), title='P-R curve for ' + class_name)
@@ -677,7 +674,7 @@ def generate_rec_prec_html(mrec, mprec, scores, class_name, ap):
       mode='vline'
     ))
     bokeh_io.save(plt)
-
+"""
 
 def adjust_axes(r, t, fig, axes):
     """

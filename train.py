@@ -11,7 +11,7 @@ from tensorflow.keras.callbacks import TensorBoard, ModelCheckpoint, ReduceLROnP
 from tensorflow_model_optimization.sparsity import keras as sparsity
 
 from yolo3.model import get_yolo3_train_model
-from yolo3.data import yolo3_data_generator_wrapper, Yolo3DataGenerator
+from yolo3.data import Yolo3DataGenerator, yolo3_tfrecord_generator_wrapper #,yolo3_data_generator_wrapper
 from yolo2.model import get_yolo2_train_model
 from yolo2.data import yolo2_data_generator_wrapper, Yolo2DataGenerator
 from common.utils import get_classes, get_anchors, get_dataset, optimize_tf_gpu
@@ -28,6 +28,9 @@ optimize_tf_gpu(tf, K)
 
 
 def main(args):
+    if args.use_horovod:
+        hvd.init()
+
     annotation_file = args.annotation_file
     log_dir = os.path.join('logs', '000')
     classes_path = args.classes_path
@@ -58,19 +61,21 @@ def main(args):
     early_stopping = EarlyStopping(monitor='val_loss', min_delta=0, patience=50, verbose=1)
     terminate_on_nan = TerminateOnNaN()
 
-    callbacks=[logging, checkpoint, reduce_lr, early_stopping, terminate_on_nan]
+    callbacks=[logging, reduce_lr, early_stopping, terminate_on_nan]
 
     # get train&val dataset
-    dataset = get_dataset(annotation_file)
-    if args.val_annotation_file:
-        val_dataset = get_dataset(args.val_annotation_file)
-        num_train = len(dataset)
-        num_val = len(val_dataset)
-        dataset.extend(val_dataset)
-    else:
-        val_split = args.val_split
-        num_val = int(len(dataset)*val_split)
-        num_train = len(dataset) - num_val
+    #dataset = get_dataset(annotation_file)
+    num_train = args.num_train
+    num_val = args.num_val
+    #if args.val_annotation_file:
+    #    val_dataset = get_dataset(args.val_annotation_file)
+    #    num_train = len(dataset)
+    #    num_val = len(val_dataset)
+    #    dataset.extend(val_dataset)
+    #else:
+    #    val_split = args.val_split
+    #    num_val = int(len(dataset)*val_split)
+    #    num_train = len(dataset) - num_val
 
     # assign multiscale interval
     if args.multiscale:
@@ -86,7 +91,8 @@ def main(args):
     if num_anchors == 9:
         # YOLOv3 use 9 anchors
         get_train_model = get_yolo3_train_model
-        data_generator = yolo3_data_generator_wrapper
+        #data_generator = yolo3_data_generator_wrapper
+        data_generator = yolo3_tfrecord_generator_wrapper
 
         # tf.keras.Sequence style data generator
         #train_data_generator = Yolo3DataGenerator(dataset[:num_train], args.batch_size, input_shape, anchors, num_classes, args.enhance_augment, rescale_interval, args.multi_anchor_assign)
@@ -96,8 +102,8 @@ def main(args):
     elif num_anchors == 6:
         # Tiny YOLOv3 use 6 anchors
         get_train_model = get_yolo3_train_model
-        data_generator = yolo3_data_generator_wrapper
-
+        #data_generator = yolo3_data_generator_wrapper
+        data_generator = yolo3_tfrecord_generator_wrapper
         # tf.keras.Sequence style data generator
         #train_data_generator = Yolo3DataGenerator(dataset[:num_train], args.batch_size, input_shape, anchors, num_classes, args.enhance_augment, rescale_interval, args.multi_anchor_assign)
         #val_data_generator = Yolo3DataGenerator(dataset[num_train:], args.batch_size, input_shape, anchors, num_classes, multi_anchor_assign=args.multi_anchor_assign)
@@ -117,14 +123,14 @@ def main(args):
         raise ValueError('Unsupported anchors number')
 
     # prepare online evaluation callback
-    if args.eval_online:
-        eval_callback = EvalCallBack(args.model_type, dataset[num_train:], anchors, class_names, args.model_image_size, args.model_pruning, log_dir, eval_epoch_interval=args.eval_epoch_interval, save_eval_checkpoint=args.save_eval_checkpoint, elim_grid_sense=args.elim_grid_sense)
-        callbacks.append(eval_callback)
+    #if args.eval_online:
+    #    eval_callback = EvalCallBack(args.model_type, dataset[num_train:], anchors, class_names, args.model_image_size, args.model_pruning, log_dir, eval_epoch_interval=args.eval_epoch_interval, save_eval_checkpoint=args.save_eval_checkpoint, elim_grid_sense=args.elim_grid_sense)
+    #    callbacks.append(eval_callback)
 
     # prepare train/val data shuffle callback
-    if args.data_shuffle:
-        shuffle_callback = DatasetShuffleCallBack(dataset)
-        callbacks.append(shuffle_callback)
+    #if args.data_shuffle:
+    #    shuffle_callback = DatasetShuffleCallBack(dataset)
+    #    callbacks.append(shuffle_callback)
 
     # prepare model pruning config
     pruning_end_step = np.ceil(1.0 * num_train / args.batch_size).astype(np.int32) * args.total_epoch
@@ -133,10 +139,30 @@ def main(args):
         callbacks = callbacks + pruning_callbacks
 
     # prepare optimizer
-    optimizer = get_optimizer(args.optimizer, args.learning_rate, decay_type=None)
+    if args.use_horovod:
+        optimizer = get_optimizer(args.optimizer, args.learning_rate * hvd.size(), decay_type=None)
+        optimizer = hvd.DistributedOptimizer(optimizer)
+
+        hvdBroadcast= [hvd.callbacks.BroadcastGlobalVariablesCallback(0)]
+        callbacks = callbacks + hvdBroadcast
+        if hvd.rank() == 0:
+            callbacks = callbacks + [checkpoint]
+    else:
+        optimizer = get_optimizer(args.optimizer, args.learning_rate, decay_type=None)
+        callbacks = callbacks + [checkpoint]
+
 
     # support multi-gpu training
-    if args.gpu_num >= 2:
+    if args.use_horovod:
+        gpus = tf.config.experimental.list_physical_devices('GPU')
+        if gpus:
+            tf.config.experimental.set_visible_devices(gpus[hvd.local_rank()], 'GPU')
+        model = get_train_model(args.model_type, anchors, num_classes, weights_path=args.weights_path, freeze_level=freeze_level, optimizer=optimizer, label_smoothing=args.label_smoothing, elim_grid_sense=args.elim_grid_sense, model_pruning=args.model_pruning, pruning_end_step=pruning_end_step)
+        
+        if hvd.rank() == 0:
+            model.summary()
+
+    elif args.gpu_num >= 2:
         # devices_list=["/gpu:0", "/gpu:1"]
         devices_list=["/gpu:{}".format(n) for n in range(args.gpu_num)]
         strategy = tf.distribute.MirroredStrategy(devices=devices_list)
@@ -144,7 +170,6 @@ def main(args):
         with strategy.scope():
             # get multi-gpu train model
             model = get_train_model(args.model_type, anchors, num_classes, weights_path=args.weights_path, freeze_level=freeze_level, optimizer=optimizer, label_smoothing=args.label_smoothing, elim_grid_sense=args.elim_grid_sense, model_pruning=args.model_pruning, pruning_end_step=pruning_end_step)
-
     else:
         # get normal train model
         model = get_train_model(args.model_type, anchors, num_classes, weights_path=args.weights_path, freeze_level=freeze_level, optimizer=optimizer, label_smoothing=args.label_smoothing, elim_grid_sense=args.elim_grid_sense, model_pruning=args.model_pruning, pruning_end_step=pruning_end_step)
@@ -157,14 +182,24 @@ def main(args):
     print("Transfer training stage")
     print('Train on {} samples, val on {} samples, with batch size {}, input_shape {}.'.format(num_train, num_val, args.batch_size, input_shape))
     #model.fit_generator(train_data_generator,
-    model.fit_generator(data_generator(dataset[:num_train], args.batch_size, input_shape, anchors, num_classes, args.enhance_augment, rescale_interval, multi_anchor_assign=args.multi_anchor_assign),
-            steps_per_epoch=max(1, num_train//args.batch_size),
+    steps_per_epoch=max(1,num_train//args.batch_size)
+    if args.use_horovod:
+        steps_per_epoch=steps_per_epoch//hvd.size()
+        if hvd.rank()==0:
+            verbose=1
+        else:
+            verbose=0
+    else:
+        verbose=1
+
+    model.fit(data_generator(args.annotation_file, args.batch_size, input_shape, anchors, num_classes, args.enhance_augment, rescale_interval, multi_anchor_assign=args.multi_anchor_assign),
+            steps_per_epoch=steps_per_epoch,
             #validation_data=val_data_generator,
-            validation_data=data_generator(dataset[num_train:], args.batch_size, input_shape, anchors, num_classes, multi_anchor_assign=args.multi_anchor_assign),
+            validation_data=data_generator(args.val_annotation_file, args.batch_size, input_shape, anchors, num_classes, multi_anchor_assign=args.multi_anchor_assign),
             validation_steps=max(1, num_val//args.batch_size),
             epochs=epochs,
             initial_epoch=initial_epoch,
-            #verbose=1,
+            verbose=verbose,
             workers=1,
             use_multiprocessing=False,
             max_queue_size=10,
@@ -196,15 +231,14 @@ def main(args):
         model.compile(optimizer=optimizer, loss={'yolo_loss': lambda y_true, y_pred: y_pred}) # recompile to apply the change
 
     print('Train on {} samples, val on {} samples, with batch size {}, input_shape {}.'.format(num_train, num_val, args.batch_size, input_shape))
-    #model.fit_generator(train_data_generator,
-    model.fit_generator(data_generator(dataset[:num_train], args.batch_size, input_shape, anchors, num_classes, args.enhance_augment, rescale_interval, multi_anchor_assign=args.multi_anchor_assign),
-        steps_per_epoch=max(1, num_train//args.batch_size),
+    model.fit(data_generator(args.annotation_file, args.batch_size, input_shape, anchors, num_classes, args.enhance_augment, rescale_interval, multi_anchor_assign=args.multi_anchor_assign),
+        steps_per_epoch=steps_per_epoch,
         #validation_data=val_data_generator,
-        validation_data=data_generator(dataset[num_train:], args.batch_size, input_shape, anchors, num_classes, multi_anchor_assign=args.multi_anchor_assign),
+        validation_data=data_generator(args.val_annotation_file, args.batch_size, input_shape, anchors, num_classes, multi_anchor_assign=args.multi_anchor_assign),
         validation_steps=max(1, num_val//args.batch_size),
         epochs=args.total_epoch,
         initial_epoch=epochs,
-        #verbose=1,
+        verbose=verbose,
         workers=1,
         use_multiprocessing=False,
         max_queue_size=10,
@@ -238,6 +272,10 @@ if __name__ == '__main__':
         help = "validation data persentage in dataset if no val dataset provide, default=%(default)s")
     parser.add_argument('--classes_path', type=str, required=False, default=os.path.join('configs', 'voc_classes.txt'),
         help='path to class definitions, default=%(default)s')
+    parser.add_argument('--num_train', type=int,required=False, default=10,
+        help = "number of samples per epoch=%(default)s")
+    parser.add_argument('--num_val', type=int,required=False, default=10,
+        help = "number of samples for validation=%(default)s")
 
     # Training options
     parser.add_argument('--batch_size', type=int, required=False, default=16,
@@ -275,13 +313,15 @@ if __name__ == '__main__':
     parser.add_argument('--model_pruning', default=False, action="store_true",
         help='Use model pruning for optimization, only for TF 1.x')
 
+    parser.add_argument('--use_horovod', default=False, action="store_true",
+        help='Whether to use horovod')
     # Evaluation options
-    parser.add_argument('--eval_online', default=False, action="store_true",
-        help='Whether to do evaluation on validation dataset during training')
-    parser.add_argument('--eval_epoch_interval', type=int, required=False, default=10,
-        help = "Number of iteration(epochs) interval to do evaluation, default=%(default)s")
-    parser.add_argument('--save_eval_checkpoint', default=False, action="store_true",
-        help='Whether to save checkpoint with best evaluation result')
+    #parser.add_argument('--eval_online', default=False, action="store_true",
+    #    help='Whether to do evaluation on validation dataset during training')
+    #parser.add_argument('--eval_epoch_interval', type=int, required=False, default=10,
+    #    help = "Number of iteration(epochs) interval to do evaluation, default=%(default)s")
+    #parser.add_argument('--save_eval_checkpoint', default=False, action="store_true",
+    #    help='Whether to save checkpoint with best evaluation result')
 
     args = parser.parse_args()
     height, width = args.model_image_size.split('x')

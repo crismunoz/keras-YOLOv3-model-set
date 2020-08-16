@@ -1,0 +1,55 @@
+#!/bin/bash
+#SBATCH --nodes=1          #Numero de Nós
+#SBATCH --ntasks-per-node=4 #Numero de tarefas por Nó
+#SBATCH --ntasks=4          #Numero de tarefas
+#SBATCH -p X          #Fila (partition) a ser utilizada
+#SBATCH -J OB_NLP            #Nome job
+#SBATCH --account=X
+
+# Show nodes
+echo $SLURM_JOB_NODELIST
+nodeset -e $SLURM_JOB_NODELIST
+echo "SLURM_JOBID: " $SLURM_JOBID
+JOBNAME=$SLURM_JOB_NAME            # re-use the job-name specified above
+
+# GLOBAL VARIABLES
+SIF_DOCKER_NAME='/scratch/parceirosbr/cristian.villalobos/docker/relation-extraction_horovod.sif'
+HOME='/scratch/parceirosbr/cristian.villalobos'
+PROJECT_HOME='${HOME}/keras-YOLOv3-model-set'
+export SINGULARITYENV_CUDA_VISIBLE_DEVICES=0,1,2,3
+
+# MODEL VARIABLES
+MODEL_TYPE=yolo4_efficientnet
+ANCHOR_PATH=configs/yolo4_anchors.txt
+MODEL_IMAGE=512x512
+
+# DATA VARIABLES
+ANNOTATION_FILE=../data/train_tf.record
+VAL_ANNOTATION_FILE=../data/valid_tf.record
+CLASS_PATH=../data/doc_classes.txt
+
+
+if [ "$SLURM_JOB_NUM_NODES" -gt 1 ]; then
+    module load openmpi/gnu/4.0.4_gcc-7.4-cuda
+    PROGRAM="mpirun singularity"
+    USE_HOROVOD="--use_horovod"
+    GPUS_NUM=$SLURM_NTASKS
+else
+    PROGRAM="singularity"
+    USE_HOROVOD=""
+    GPUS_NUM=4
+fi
+
+$PROGRAM run -B $HOME --nv ${SIF_DOCKER_NAME} bash -c "cd ${PROJECT_HOME}; HOME=${PROJECT_HOME} python train.py --model_type=$MODEL_TYPE \
+--anchors_path=$ANCHOR_PATH \
+--annotation_file=$ANNOTATION_FILE \
+--val_annotation_file=$VAL_ANNOTATION_FILE \
+--gpu_num $GPUS_NUM \
+--transfer_epoch 20 \
+--total_epoch 250 \
+--data_shuffle \
+--learning_rate 0.0001 \
+--optimizer adam \
+--model_image_size=$MODEL_IMAGE \
+--classes_path=$CLASS_PATH \
+--batch_size 2 $USE_HOROVOD"
